@@ -2,4 +2,5 @@ node_modules
 dist
 .idea
 ./*.bin
+./*.nm4
 .vscode

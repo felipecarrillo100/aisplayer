@@ -10,6 +10,7 @@
   "license": "ISC",
   "dependencies": {
     "ais-web": "^0.0.4",
+    "csv-parse": "^5.6.0",
     "mqtt": "^5.13.1",
     "stompjs": "^2.3.3"
   }

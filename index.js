@@ -9,6 +9,7 @@ const MessageProducerSTOMP = require('./MessageProducerSTOMP');
 const { AisReceiver } = require('ais-web');
 
 const aisReceiver = new AisReceiver();
+
 const DEFAULT_FILE = './DonneesBrutesAIS.bin';
 const DEFAULT_STOMP_PORT = 61613;
 const EXAMPLE_MQTT_BROKER = 'mqtt://localhost:1883';
@@ -21,7 +22,7 @@ function printHelp() {
 Usage: node aisPlayer.js [options]
 
 Options:
-  -f, --file         Path to binary AIS file (default: ${DEFAULT_FILE})
+  -f, --file         Path to AIS file (.bin or .nm4) (default: ${DEFAULT_FILE})
   -b, --broker       Broker URL or host (mandatory unless --info):
                        MQTT example: ${EXAMPLE_MQTT_BROKER}
                        STOMP example: ${EXAMPLE_STOMP_BROKER}
@@ -30,9 +31,18 @@ Options:
   -t, --topic        Topic/Route prefix to send messages (default: ${DEFAULT_TOPIC})
                      (For STOMP, "/topic/" prefix will be added automatically)
   -s, --separator    STOMP topic separator character (default: "${DEFAULT_SEPARATOR}"; options: "/" or ".")
-  -i, --info         Show statistics about AIS binary file and exit
+  -i, --info         Show statistics about AIS file and exit
   -h, --help         Show this help message
 `);
+}
+
+function replaceDataWithControl(path) {
+  const parts = path.split('/');
+  if (parts.length >= 3 && parts[0] === 'producers' && parts[2] === 'data') {
+    parts[2] = 'control';
+    return parts.join('/');
+  }
+  return path; // return unchanged if format is unexpected
 }
 
 const args = minimist(process.argv.slice(2), {
@@ -113,6 +123,30 @@ function parseBinFile(filePath) {
   return aisPackets;
 }
 
+function parseNm4File(filePath) {
+  const lines = fs.readFileSync(filePath, 'utf-8').split(/\r?\n/);
+  const packets = [];
+
+  for (const line of lines) {
+    if (!line.startsWith('\\s:')) continue;
+
+    const match = line.match(/c:(\d+)\*\w+\\(.*)/);
+    if (!match) continue;
+
+    const timestampSec = parseInt(match[1], 10);
+    const sentence = match[2]?.trim();
+    if (!sentence?.startsWith('!')) continue;
+
+    packets.push({
+      timestampSec,
+      timestampUsec: 0,
+      data: Buffer.from(sentence, 'utf-8'),
+    });
+  }
+
+  return packets;
+}
+
 function formatTimestamp(sec, usec) {
   return new Date((sec * 1000) + Math.floor(usec / 1000)).toISOString();
 }
@@ -123,9 +157,11 @@ function printFileStats(packets) {
     return;
   }
 
-  const startSec = packets[0].timestampSec + packets[0].timestampUsec / 1e6;
-  const endSec = packets[packets.length - 1].timestampSec + packets[packets.length - 1].timestampUsec / 1e6;
-  const duration = endSec - startSec;
+  const isNm4 = packets.every(pkt => pkt.timestampUsec === 0);
+  const typeLabel = isNm4 ? '.nm4 (text)' : '.bin (binary)';
+  const start = packets[0].timestampSec + packets[0].timestampUsec / 1e6;
+  const end = packets[packets.length - 1].timestampSec + packets[packets.length - 1].timestampUsec / 1e6;
+  const duration = end - start;
 
   const mmsiSet = new Set();
   for (const pkt of packets) {
@@ -135,15 +171,25 @@ function printFileStats(packets) {
     if (decoded?.mmsi) mmsiSet.add(decoded.mmsi);
   }
 
-  console.log('=== AIS Binary File Statistics ===');
+  console.log('=== AIS File Statistics ===');
   console.log(`File: ${args.file}`);
+  console.log(`Type: ${typeLabel}`);
   console.log(`Number of packets: ${packets.length}`);
   console.log(`Unique MMSIs (vessels): ${mmsiSet.size}`);
   console.log(`Start time (UTC): ${formatTimestamp(packets[0].timestampSec, packets[0].timestampUsec)}`);
   console.log(`End time   (UTC): ${formatTimestamp(packets[packets.length - 1].timestampSec, packets[packets.length - 1].timestampUsec)}`);
   console.log(`Duration (seconds): ${duration.toFixed(3)}`);
   console.log(`Duration (hours): ${(duration / 3600).toFixed(3)}`);
-  console.log('==================================');
+  console.log('============================');
+}
+
+function formatTimeHMS(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return [h, m, s]
+      .map(v => v.toString().padStart(2, '0'))
+      .join(':');
 }
 
 async function playPackets(packets, onSend) {
@@ -153,29 +199,58 @@ async function playPackets(packets, onSend) {
   }
 
   const startTime = packets[0].timestampSec + packets[0].timestampUsec / 1e6;
+  const endTime = packets[packets.length - 1].timestampSec + packets[packets.length - 1].timestampUsec / 1e6;
+  const totalDuration = endTime - startTime;
+
   const playbackStart = Date.now() / 1000;
+
+  let lastHeartbeat = 0;
+  const heartbeatInterval = 5000; // milliseconds
 
   for (const packet of packets) {
     const packetTime = packet.timestampSec + packet.timestampUsec / 1e6;
     const offset = packetTime - startTime;
 
-    const now = Date.now() / 1000;
+    let now = Date.now() / 1000;
     const scheduledTime = playbackStart + offset;
-    const waitTime = scheduledTime - now;
+    let waitTime = scheduledTime - now;
 
-    if (waitTime > 0) {
-      await new Promise((r) => setTimeout(r, waitTime * 1000));
+    // Heartbeat message while waiting
+    while (waitTime > 0) {
+      if (Date.now() - lastHeartbeat > heartbeatInterval) {
+        const simulatedTimeSec = startTime + (Date.now() / 1000 - playbackStart);
+        const timestamp = new Date(simulatedTimeSec * 1000);
+        const formatted = timestamp.toISOString().replace(/T/, ' ').replace(/\..+/, '').replace(/-/g, '/');
+
+        const percentPlayed = ((simulatedTimeSec - startTime) / totalDuration * 100).toFixed(1);
+        const secondsRemaining = Math.max(0, endTime - simulatedTimeSec);
+        const timeRemainingHMS = formatTimeHMS(secondsRemaining);
+
+        console.log(`[${formatted}] Waiting for next packet... ${waitTime.toFixed(1)}s remaining (${percentPlayed}%, ${timeRemainingHMS} remaining)`);
+
+        lastHeartbeat = Date.now();
+      }
+      const sleepTime = Math.min(waitTime, heartbeatInterval / 1000);
+      await new Promise(r => setTimeout(r, sleepTime * 1000));
+      now = Date.now() / 1000;
+      waitTime = scheduledTime - now;
     }
 
     const sentence = packet.data.toString('utf-8').trim();
     if (!sentence.startsWith('!')) continue;
-    onSend(sentence);
+    onSend(packetTime, sentence);
   }
 }
 
 (async () => {
   try {
-    const aisPackets = parseBinFile(args.file);
+    let aisPackets;
+
+    if (args.file.endsWith('.nm4')) {
+      aisPackets = parseNm4File(args.file);
+    } else {
+      aisPackets = parseBinFile(args.file);
+    }
 
     if (args.info) {
       printFileStats(aisPackets);
@@ -204,27 +279,38 @@ async function playPackets(packets, onSend) {
         topicSeparator: separator,
       });
 
-      // Clean trailing slashes to avoid issues
       topic = topic.replace(/\/+$/, '');
     } else {
       throw new Error('Unsupported protocol');
     }
 
     await producer.init();
+    const topicControl = replaceDataWithControl(topic);
+    const controlMessage = { action: "CLEAR" };
+    producer.sendMessage(topicControl, JSON.stringify(controlMessage));
 
-    const onSend = (sentence) => {
-      const decoded = aisReceiver.extractSentenceRawFields(sentence);
-      if (!decoded?.mmsi) {
-        console.log(`MMSI not found for ${sentence}`);
-        return;
+    let lastPacketKey = null;
+    const onSend = (packetTime, sentence) => {
+      try {
+        const key = `${packetTime}|${sentence}`;
+        if (key === lastPacketKey) return; // Skip consecutive duplicate
+        lastPacketKey = key;
+
+        const decoded = aisReceiver.extractSentenceRawFields(sentence);
+        if (!decoded?.mmsi) {
+          console.warn(`Skipping: no MMSI found for sentence: ${sentence}`);
+          return;
+        }
+
+        const destinationTopic = `${topic}/${decoded.mmsi}`;
+        producer.sendMessage(destinationTopic, sentence);
+
+        const timestamp = new Date(packetTime * 1000);
+        const formatted = timestamp.toISOString().replace(/T/, ' ').replace(/\..+/, '').replace(/-/g, '/');
+        console.log(`[${formatted}] ${protocol.toUpperCase()} → ${producer.createPath(destinationTopic)}: ${sentence}`);
+      } catch (err) {
+        console.error(`Failed to send or parse sentence: ${sentence}`, err);
       }
-
-      let destinationTopic;
-
-      destinationTopic = `${topic}/${decoded.mmsi}`;
-
-      producer.sendMessage(destinationTopic, sentence);
-      console.log(`${protocol.toUpperCase()} sent to ${producer.createPath(destinationTopic)}: ${sentence}`);
     };
 
     await playPackets(aisPackets, onSend);

@@ -1,6 +1,8 @@
 node_modules
 dist
 .idea
-./*.bin
-./*.nm4
 .vscode
+
+# Ignore AIS data files
+*.nm4
+*.bin

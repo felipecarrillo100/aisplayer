@@ -31,6 +31,7 @@ Options:
   -t, --topic        Topic/Route prefix to send messages (default: ${DEFAULT_TOPIC})
                      (For STOMP, "/topic/" prefix will be added automatically)
   -s, --separator    STOMP topic separator character (default: "${DEFAULT_SEPARATOR}"; options: "/" or ".")
+  -r, --rate         Playback rate multiplier (default: 1, real-time)
   -i, --info         Show statistics about AIS file and exit
   -h, --help         Show this help message
 `);
@@ -42,11 +43,11 @@ function replaceDataWithControl(path) {
     parts[2] = 'control';
     return parts.join('/');
   }
-  return path; // return unchanged if format is unexpected
+  return path;
 }
 
 const args = minimist(process.argv.slice(2), {
-  string: ['file', 'broker', 'username', 'password', 'topic', 'separator'],
+  string: ['file', 'broker', 'username', 'password', 'topic', 'separator', 'rate'],
   boolean: ['help', 'info'],
   alias: {
     f: 'file',
@@ -55,6 +56,7 @@ const args = minimist(process.argv.slice(2), {
     p: 'password',
     t: 'topic',
     s: 'separator',
+    r: 'rate',
     i: 'info',
     h: 'help',
   },
@@ -62,6 +64,7 @@ const args = minimist(process.argv.slice(2), {
     file: DEFAULT_FILE,
     topic: DEFAULT_TOPIC,
     separator: DEFAULT_SEPARATOR,
+    rate: '1',
   },
 });
 
@@ -73,6 +76,12 @@ if (args.help) {
 if (!args.broker && !args.info) {
   console.error('Error: broker is mandatory unless --info is used.');
   printHelp();
+  process.exit(1);
+}
+
+const playbackRate = Number(args.rate);
+if (isNaN(playbackRate) || playbackRate <= 0) {
+  console.error(`Invalid playback rate: ${args.rate}`);
   process.exit(1);
 }
 
@@ -187,9 +196,7 @@ function formatTimeHMS(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
-  return [h, m, s]
-      .map(v => v.toString().padStart(2, '0'))
-      .join(':');
+  return [h, m, s].map(v => v.toString().padStart(2, '0')).join(':');
 }
 
 async function playPackets(packets, onSend) {
@@ -203,42 +210,36 @@ async function playPackets(packets, onSend) {
   const totalDuration = endTime - startTime;
 
   const playbackStart = Date.now() / 1000;
+  let packetIndex = 0;
+  let lastHeartbeatSimTime = startTime;
+  const HEARTBEAT_SIM_INTERVAL = 5;
 
-  let lastHeartbeat = 0;
-  const heartbeatInterval = 5000; // milliseconds
+  while (packetIndex < packets.length) {
+    const now = Date.now() / 1000;
+    const elapsedReal = now - playbackStart;
+    const simulatedTime = startTime + elapsedReal * playbackRate;
 
-  for (const packet of packets) {
-    const packetTime = packet.timestampSec + packet.timestampUsec / 1e6;
-    const offset = packetTime - startTime;
-
-    let now = Date.now() / 1000;
-    const scheduledTime = playbackStart + offset;
-    let waitTime = scheduledTime - now;
-
-    // Heartbeat message while waiting
-    while (waitTime > 0) {
-      if (Date.now() - lastHeartbeat > heartbeatInterval) {
-        const simulatedTimeSec = startTime + (Date.now() / 1000 - playbackStart);
-        const timestamp = new Date(simulatedTimeSec * 1000);
-        const formatted = timestamp.toISOString().replace(/T/, ' ').replace(/\..+/, '').replace(/-/g, '/');
-
-        const percentPlayed = ((simulatedTimeSec - startTime) / totalDuration * 100).toFixed(1);
-        const secondsRemaining = Math.max(0, endTime - simulatedTimeSec);
-        const timeRemainingHMS = formatTimeHMS(secondsRemaining);
-
-        console.log(`[${formatted}] Waiting for next packet... ${waitTime.toFixed(1)}s remaining (${percentPlayed}%, ${timeRemainingHMS} remaining)`);
-
-        lastHeartbeat = Date.now();
-      }
-      const sleepTime = Math.min(waitTime, heartbeatInterval / 1000);
-      await new Promise(r => setTimeout(r, sleepTime * 1000));
-      now = Date.now() / 1000;
-      waitTime = scheduledTime - now;
+    if (simulatedTime - lastHeartbeatSimTime >= HEARTBEAT_SIM_INTERVAL) {
+      lastHeartbeatSimTime = simulatedTime;
+      const timestamp = new Date(simulatedTime * 1000);
+      const formatted = timestamp.toISOString().replace(/T/, ' ').replace(/\..+/, '').replace(/-/g, '/');
+      const percentPlayed = ((simulatedTime - startTime) / totalDuration * 100).toFixed(1);
+      const timeRemainingHMS = formatTimeHMS(Math.max(0, endTime - simulatedTime));
+      console.log(`[${formatted}] Waiting... (${percentPlayed}%, ${timeRemainingHMS} remaining)`);
     }
 
-    const sentence = packet.data.toString('utf-8').trim();
-    if (!sentence.startsWith('!')) continue;
-    onSend(packetTime, sentence);
+    while (
+        packetIndex < packets.length &&
+        (packets[packetIndex].timestampSec + packets[packetIndex].timestampUsec / 1e6) <= simulatedTime
+        ) {
+      const packet = packets[packetIndex++];
+      const sentence = packet.data.toString('utf-8').trim();
+      if (sentence.startsWith('!')) {
+        onSend(packet.timestampSec + packet.timestampUsec / 1e6, sentence);
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 50));
   }
 }
 
@@ -262,40 +263,24 @@ async function playPackets(packets, onSend) {
     let producer;
 
     if (protocol === 'mqtt') {
-      producer = new MessageProducerMQTT({
-        brokerUrl: broker,
-        username,
-        password,
-      });
+      producer = new MessageProducerMQTT({ brokerUrl: broker, username, password });
     } else if (protocol === 'stomp') {
       const [host, portStr] = broker.split(':');
       const port = parseInt(portStr, 10) || DEFAULT_STOMP_PORT;
 
-      producer = new MessageProducerSTOMP({
-        relayhost: host,
-        port,
-        username,
-        password,
-        topicSeparator: separator,
-      });
+      producer = new MessageProducerSTOMP({ relayhost: host, port, username, password, topicSeparator: separator });
 
-      topic = topic.replace(/\/+$/, '');
+      topic = topic.replace(/\/+\$/, '');
     } else {
       throw new Error('Unsupported protocol');
     }
 
     await producer.init();
     const topicControl = replaceDataWithControl(topic);
-    const controlMessage = { action: "CLEAR" };
-    producer.sendMessage(topicControl, JSON.stringify(controlMessage));
+    producer.sendMessage(topicControl, JSON.stringify({ action: "CLEAR" }));
 
-    let lastPacketKey = null;
     const onSend = (packetTime, sentence) => {
       try {
-        const key = `${packetTime}|${sentence}`;
-        if (key === lastPacketKey) return; // Skip consecutive duplicate
-        lastPacketKey = key;
-
         const decoded = aisReceiver.extractSentenceRawFields(sentence);
         if (!decoded?.mmsi) {
           console.warn(`Skipping: no MMSI found for sentence: ${sentence}`);
